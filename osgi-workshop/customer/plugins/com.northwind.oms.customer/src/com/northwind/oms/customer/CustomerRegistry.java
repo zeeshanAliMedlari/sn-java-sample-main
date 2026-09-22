@@ -27,3 +27,5 @@ public class CustomerRegistry {
         return customers.size();
     }
 }
+
+// Testing changed 
