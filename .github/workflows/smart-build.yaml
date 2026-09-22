@@ -3,7 +3,7 @@ name: Northwind OSGi Smart Build
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       mode:
@@ -11,9 +11,7 @@ on:
         required: true
         default: changed
         type: choice
-        options:
-          - changed
-          - all
+        options: [changed, all]
       base_sha:
         description: Optional base commit for changed mode. Leave empty to compare HEAD~1.
         required: false
@@ -29,24 +27,16 @@ concurrency:
 jobs:
   smart-build:
     runs-on: ubuntu-latest
-
     defaults:
       run:
         working-directory: osgi-workshop
 
     steps:
-
-      # ============================================================
-      # 1. CHECKOUT
-      # ============================================================
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      # ============================================================
-      # 2. JAVA
-      # ============================================================
       - name: Set up Java 17
         uses: actions/setup-java@v6
         with:
@@ -54,935 +44,379 @@ jobs:
           java-version: '17'
           cache: maven
 
-      # ============================================================
-      # 3. SMART BUILD
-      # ============================================================
       - name: Resolve graph, select modules, and build
         id: smart-build
         shell: bash
-
         env:
           BUILD_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'changed' }}
           EVENT_NAME: ${{ github.event_name }}
-
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
           MANUAL_BASE_SHA: ${{ inputs.base_sha }}
-
         run: |
           set -euo pipefail
 
           echo "============================================================"
           echo "Northwind OSGi Smart Build"
-          echo "============================================================"
-          echo "Mode : ${BUILD_MODE}"
+          echo "Mode: ${BUILD_MODE}"
           echo "Event: ${EVENT_NAME}"
           echo "============================================================"
 
-          # ========================================================
-          # COMPONENTS
-          # ========================================================
-
-          COMPONENTS=(
-            catalog
-            customer
-            security
-            payment
-            shipping
-            notification
-            orders
-            reporting
-            thirdparty
-          )
+          # Product components are the nine top-level Maven modules in the workshop.
+          COMPONENTS=(catalog customer security payment shipping notification orders reporting thirdparty)
 
           declare -A COMPONENT_EXISTS=()
           declare -A BUNDLE_TO_COMPONENT=()
           declare -A PACKAGE_TO_COMPONENT=()
           declare -A FEATURE_TO_COMPONENT=()
-
-          # dependency --> dependent
           declare -A EDGES=()
           declare -A REVERSE=()
-
           declare -A SELECTED=()
           declare -A CHANGED=()
+          declare -A VISITED=()
           declare -A IN_DEGREE=()
 
           for component in "${COMPONENTS[@]}"; do
             COMPONENT_EXISTS["$component"]=1
           done
 
-          # ========================================================
-          # HELPER FUNCTIONS
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # Helpers for OSGi manifest headers that use continuation lines.
+          # ------------------------------------------------------------
           header_value() {
-            local file="$1"
-            local header="$2"
-
+            local file="$1" header="$2"
             awk -v wanted="$header" '
-              BEGIN {
-                capture=0
-                value=""
-              }
-
+              BEGIN { capture=0; value="" }
               $0 ~ "^" wanted ":" {
                 capture=1
                 sub("^" wanted ": *", "")
                 value=value $0
                 next
               }
-
               capture && /^ / {
                 sub(/^ /, "")
                 value=value $0
                 next
               }
-
-              capture {
-                print value
-                exit
-              }
-
-              END {
-                if (capture)
-                  print value
-              }
+              capture { print value; exit }
+              END { if (capture) print value }
             ' "$file" | head -n 1
           }
 
           trim_token() {
             local token="$1"
-
             token="${token%%;*}"
             token="${token%%,*}"
-
-            echo "$token" |
-              sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            echo "$token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
           }
 
           add_edge() {
-            local dependency="$1"
-            local dependent="$2"
-
+            local dependency="$1" dependent="$2"
             [[ -n "${COMPONENT_EXISTS[$dependency]:-}" ]] || return 0
             [[ -n "${COMPONENT_EXISTS[$dependent]:-}" ]] || return 0
-
             [[ "$dependency" == "$dependent" ]] && return 0
-
             EDGES["$dependency|$dependent"]=1
             REVERSE["$dependent|$dependency"]=1
           }
 
-          # ========================================================
-          # 1. DISCOVER OSGI METADATA
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # 1. Discover bundle IDs, exported packages and feature IDs.
+          # ------------------------------------------------------------
           echo
-          echo "[1/6] Discovering OSGi metadata..."
+          echo "[1/6] Discovering OSGi bundles and features..."
 
           while IFS= read -r manifest; do
-
             component="${manifest#./}"
             component="${component%%/*}"
-
-            bundle="$(
-              header_value "$manifest" 'Bundle-SymbolicName' |
-              sed 's/;.*//'
-            )"
-
-            if [[ -n "$bundle" ]]; then
-              BUNDLE_TO_COMPONENT["$bundle"]="$component"
-            fi
+            bundle="$(header_value "$manifest" 'Bundle-SymbolicName' | sed 's/;.*//')"
+            [[ -n "$bundle" ]] && BUNDLE_TO_COMPONENT["$bundle"]="$component"
 
             exports="$(header_value "$manifest" 'Export-Package')"
-
             IFS=',' read -ra export_tokens <<< "$exports"
-
             for token in "${export_tokens[@]}"; do
-
               pkg="$(trim_token "$token")"
-
-              if [[ -n "$pkg" ]]; then
-                PACKAGE_TO_COMPONENT["$pkg"]="$component"
-              fi
-
+              [[ -n "$pkg" ]] && PACKAGE_TO_COMPONENT["$pkg"]="$component"
             done
-
-          done < <(
-            find . \
-              -type f \
-              -path '*/META-INF/MANIFEST.MF' |
-            sort
-          )
+          done < <(find . -type f -path '*/META-INF/MANIFEST.MF' | sort)
 
           while IFS= read -r feature; do
-
             component="${feature#./}"
             component="${component%%/*}"
+            feature_id="$(sed -n 's/.*id="\([^"]*\.feature\)".*/\1/p' "$feature" | head -n 1)"
+            [[ -n "$feature_id" ]] && FEATURE_TO_COMPONENT["$feature_id"]="$component"
+          done < <(find . -type f -name feature.xml | sort)
 
-            feature_id="$(
-              sed -n \
-                's/.*id="\([^"]*\.feature\)".*/\1/p' \
-                "$feature" |
-              head -n 1
-            )"
+          echo "Bundles discovered: ${#BUNDLE_TO_COMPONENT[@]}"
+          echo "Exported packages discovered: ${#PACKAGE_TO_COMPONENT[@]}"
+          echo "Features discovered: ${#FEATURE_TO_COMPONENT[@]}"
 
-            if [[ -n "$feature_id" ]]; then
-              FEATURE_TO_COMPONENT["$feature_id"]="$component"
-            fi
-
-          done < <(
-            find . \
-              -type f \
-              -name feature.xml |
-            sort
-          )
-
-          # ========================================================
-          # 2. BUILD DEPENDENCY GRAPH
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # 2. Build the product dependency graph.
+          #    Direction: dependency --> dependent
+          # ------------------------------------------------------------
           echo
-          echo "[2/6] Building dependency graph..."
+          echo "[2/6] Building product dependency graph..."
 
-          # --------------------------------------------------------
-          # Feature dependencies
-          # --------------------------------------------------------
-
+          # Feature-to-feature dependencies.
           while IFS= read -r feature; do
-
             dependent_component="${feature#./}"
             dependent_component="${dependent_component%%/*}"
-
             while IFS= read -r required_feature; do
-
-              feature_id="$(
-                echo "$required_feature" |
-                sed 's/.*feature="\([^"]*\.feature\)".*/\1/'
-              )
-
+              feature_id="$(echo "$required_feature" | sed -n 's/.*feature="\([^"]*\.feature\)".*/\1/p')"
               dependency_component="${FEATURE_TO_COMPONENT[$feature_id]:-}"
+              [[ -n "$dependency_component" ]] && add_edge "$dependency_component" "$dependent_component"
+            done < <(grep -E '<import[[:space:]]+feature="[^"]+"' "$feature" || true)
+          done < <(find . -type f -name feature.xml | sort)
 
-              if [[ -n "$dependency_component" ]]; then
-                add_edge \
-                  "$dependency_component" \
-                  "$dependent_component"
-              fi
-
-            done < <(
-              grep -E \
-                '<import[[:space:]]+feature="[^"]+"' \
-                "$feature" ||
-              true
-            )
-
-          done < <(
-            find . \
-              -type f \
-              -name feature.xml |
-            sort
-          )
-
-          # --------------------------------------------------------
-          # Require-Bundle dependencies
-          # --------------------------------------------------------
-
+          # Bundle-level dependencies from Require-Bundle.
           while IFS= read -r manifest; do
-
             dependent_component="${manifest#./}"
             dependent_component="${dependent_component%%/*}"
-
-            requires="$(
-              header_value "$manifest" 'Require-Bundle'
-            )"
-
+            requires="$(header_value "$manifest" 'Require-Bundle')"
             IFS=',' read -ra require_tokens <<< "$requires"
-
             for token in "${require_tokens[@]}"; do
-
               bundle="$(trim_token "$token")"
-
               dependency_component="${BUNDLE_TO_COMPONENT[$bundle]:-}"
-
-              if [[ -n "$dependency_component" ]]; then
-
-                add_edge \
-                  "$dependency_component" \
-                  "$dependent_component"
-
-              fi
-
+              [[ -n "$dependency_component" ]] && add_edge "$dependency_component" "$dependent_component"
             done
+          done < <(find . -type f -path '*/META-INF/MANIFEST.MF' | sort)
 
-          done < <(
-            find . \
-              -type f \
-              -path '*/META-INF/MANIFEST.MF' |
-            sort
-          )
-
-          # --------------------------------------------------------
-          # Import-Package --> Export-Package dependencies
-          # --------------------------------------------------------
-
+          # Package-level dependencies from Import-Package -> Export-Package.
           while IFS= read -r manifest; do
-
             dependent_component="${manifest#./}"
             dependent_component="${dependent_component%%/*}"
-
-            imports="$(
-              header_value "$manifest" 'Import-Package'
-            )"
-
+            imports="$(header_value "$manifest" 'Import-Package')"
             IFS=',' read -ra import_tokens <<< "$imports"
-
             for token in "${import_tokens[@]}"; do
-
               pkg="$(trim_token "$token")"
-
               dependency_component="${PACKAGE_TO_COMPONENT[$pkg]:-}"
-
-              if [[ -n "$dependency_component" ]]; then
-
-                add_edge \
-                  "$dependency_component" \
-                  "$dependent_component"
-
-              fi
-
+              [[ -n "$dependency_component" ]] && add_edge "$dependency_component" "$dependent_component"
             done
+          done < <(find . -type f -path '*/META-INF/MANIFEST.MF' | sort)
 
-          done < <(
-            find . \
-              -type f \
-              -path '*/META-INF/MANIFEST.MF' |
-            sort
-          )
-
-          echo
           echo "Resolved dependency edges:"
-          echo "Direction: dependency --> dependent"
-          echo
-
           for edge in "${!EDGES[@]}"; do
-
             dependency="${edge%%|*}"
             dependent="${edge#*|}"
-
-            echo "  ${dependency} --> ${dependent}"
-
+            echo "  $dependency --> $dependent"
           done | sort
 
-          # ========================================================
-          # 3. DETECT CHANGES
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # 3. Detect changed product components.
+          # ------------------------------------------------------------
           echo
-          echo "[3/6] Detecting changed components..."
+          echo "[3/6] Detecting changed modules..."
 
           if [[ "$BUILD_MODE" == "all" ]]; then
-
-            echo "Full-build mode selected."
-
             for component in "${COMPONENTS[@]}"; do
               CHANGED["$component"]=1
             done
-
+            echo "Full-build mode selected; all product components are selected."
           else
-
             if [[ "$EVENT_NAME" == "pull_request" ]]; then
-
               BASE_SHA="$PR_BASE_SHA"
-
             elif [[ "$EVENT_NAME" == "push" ]]; then
-
               BASE_SHA="$PUSH_BEFORE_SHA"
-
             elif [[ -n "$MANUAL_BASE_SHA" ]]; then
-
               BASE_SHA="$MANUAL_BASE_SHA"
-
             else
-
               BASE_SHA="HEAD~1"
-
             fi
 
             if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
-
-              echo "No usable base SHA supplied."
-              echo "Falling back to full build."
-
-              for component in "${COMPONENTS[@]}"; do
-                CHANGED["$component"]=1
-              done
-
+              echo "No usable base SHA was supplied; falling back to full build."
+              for component in "${COMPONENTS[@]}"; do CHANGED["$component"]=1; done
             else
-
-              echo "Comparing:"
-              echo "  BASE: $BASE_SHA"
-              echo "  HEAD: $(git rev-parse HEAD)"
-              echo
-
-              mapfile -t CHANGED_FILES < <(
-                git diff \
-                  --name-only \
-                  "$BASE_SHA" \
-                  HEAD
-              )
-
-              echo "Changed files:"
-
-              if [[ "${#CHANGED_FILES[@]}" -eq 0 ]]; then
-                echo "  <none>"
-              else
-                printf '  %s\n' "${CHANGED_FILES[@]}"
-              fi
-
-              echo
+              echo "Comparing against: $BASE_SHA"
+              mapfile -t CHANGED_FILES < <(git diff --name-only "$BASE_SHA" HEAD)
+              printf '%s\n' "${CHANGED_FILES[@]:-<none>}"
 
               for path in "${CHANGED_FILES[@]}"; do
-
                 [[ -n "$path" ]] || continue
-
+                # git diff is repository-root relative, while this job runs from osgi-workshop/.
                 path="${path#osgi-workshop/}"
-
                 component="${path%%/*}"
-
                 if [[ -n "${COMPONENT_EXISTS[$component]:-}" ]]; then
-
                   CHANGED["$component"]=1
-
-                  echo "Detected product change:"
-                  echo "  $component"
-                  echo "  $path"
-
                 else
-
+                  # Root build metadata can affect every module.
                   case "$path" in
-
                     pom.xml|.mvn/*|.mvnw|.mvnw.cmd|.github/workflows/*)
-
-                      echo "Build-wide change detected:"
-                      echo "  $path"
-
-                      for c in "${COMPONENTS[@]}"; do
-                        CHANGED["$c"]=1
-                      done
-
+                      for c in "${COMPONENTS[@]}"; do CHANGED["$c"]=1; done
                       ;;
-
                   esac
-
                 fi
-
               done
-
             fi
 
-            # ------------------------------------------------------
-            # IMPORTANT:
-            # Do not use ${#CHANGED[@]} here with set -u.
-            # Explicitly count populated components instead.
-            # ------------------------------------------------------
-
-            changed_count=0
-
-            for component in "${COMPONENTS[@]}"; do
-
-              if [[ -n "${CHANGED[$component]:-}" ]]; then
-                changed_count=$((changed_count + 1))
-              fi
-
-            done
-
-            if [[ "$changed_count" -eq 0 ]]; then
-
-              echo
-              echo "No product changes detected."
-              echo "Nothing needs to be rebuilt."
-
-              {
-                echo "## Northwind OSGi Smart Build"
-                echo
-                echo "No product changes detected."
-                echo "No modules were rebuilt."
-              } >> "$GITHUB_STEP_SUMMARY"
-
+            if [[ "${#CHANGED[@]}" -eq 0 ]]; then
+              echo "No product changes detected. Nothing to rebuild."
+              echo "No product changes detected." >> "$GITHUB_STEP_SUMMARY"
               exit 0
-
             fi
-
           fi
 
-          echo
-          echo "Changed components:"
-
+          echo "Changed/initially selected components:"
           for component in "${COMPONENTS[@]}"; do
-
-            if [[ -n "${CHANGED[$component]:-}" ]]; then
-              echo "  - $component"
-            fi
-
+              [[ -n "${CHANGED[$component]:-}" ]] && printf -- '- `%s`\n' "$component"
           done
 
-          # ========================================================
-          # 4. SELECT TRANSITIVE DEPENDENTS
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # 4. Reverse traversal: changed component -> all dependents.
+          # ------------------------------------------------------------
           echo
-          echo "[4/6] Resolving transitive dependents..."
+          echo "[4/6] Resolving transitive dependent modules..."
 
           queue=()
-
-          for component in "${COMPONENTS[@]}"; do
-
-            if [[ -n "${CHANGED[$component]:-}" ]]; then
-
-              SELECTED["$component"]=1
-              queue+=("$component")
-
-            fi
-
+          for component in "${!CHANGED[@]}"; do
+            SELECTED["$component"]=1
+            queue+=("$component")
           done
 
           while ((${#queue[@]} > 0)); do
-
             current="${queue[0]}"
             queue=("${queue[@]:1}")
 
             for edge in "${!REVERSE[@]}"; do
-
               dependent="${edge%%|*}"
               dependency="${edge#*|}"
-
               [[ "$dependency" == "$current" ]] || continue
-
               if [[ -z "${SELECTED[$dependent]:-}" ]]; then
-
                 SELECTED["$dependent"]=1
                 queue+=("$dependent")
-
-                echo \
-                  "  $current --> $dependent (selected)"
-
+                echo "  $current --> $dependent (selected)"
               fi
-
             done
-
           done
 
-          # ========================================================
-          # 5. TOPOLOGICAL SORT
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # 5. Topological sort of the selected product graph.
+          # ------------------------------------------------------------
           echo
           echo "[5/6] Calculating dependency-safe build order..."
 
-          for component in "${COMPONENTS[@]}"; do
-
-            if [[ -n "${SELECTED[$component]:-}" ]]; then
-              IN_DEGREE["$component"]=0
-            fi
-
+          for component in "${!SELECTED[@]}"; do
+            IN_DEGREE["$component"]=0
           done
 
           for edge in "${!EDGES[@]}"; do
-
             dependency="${edge%%|*}"
             dependent="${edge#*|}"
-
-            if [[ \
-              -n "${SELECTED[$dependency]:-}" &&
-              -n "${SELECTED[$dependent]:-}"
-            ]]; then
-
-              IN_DEGREE["$dependent"]=$(
-                (
-                  ${IN_DEGREE[$dependent]:-0} + 1
-                )
-              )
-
+            if [[ -n "${SELECTED[$dependency]:-}" && -n "${SELECTED[$dependent]:-}" ]]; then
+              IN_DEGREE["$dependent"]=$(( ${IN_DEGREE[$dependent]} + 1 ))
             fi
-
           done
 
           ready=()
-
-          for component in "${COMPONENTS[@]}"; do
-
-            if [[ \
-              -n "${SELECTED[$component]:-}" &&
-              "${IN_DEGREE[$component]:-0}" -eq 0
-            ]]; then
-
-              ready+=("$component")
-
-            fi
-
+          for component in "${!SELECTED[@]}"; do
+            [[ "${IN_DEGREE[$component]}" -eq 0 ]] && ready+=("$component")
           done
-
-          IFS=$'\n'
-          ready=($(sort <<< "${ready[*]}"))
+          IFS=$'\n' ready=($(sort <<< "${ready[*]}"))
           unset IFS
 
           BUILD_ORDER=()
-
           while ((${#ready[@]} > 0)); do
-
             current="${ready[0]}"
             ready=("${ready[@]:1}")
-
             BUILD_ORDER+=("$current")
 
             for edge in "${!EDGES[@]}"; do
-
               dependency="${edge%%|*}"
               dependent="${edge#*|}"
-
               [[ "$dependency" == "$current" ]] || continue
               [[ -n "${SELECTED[$dependent]:-}" ]] || continue
-
-              IN_DEGREE["$dependent"]=$(
-                (
-                  ${IN_DEGREE[$dependent]:-0} - 1
-                )
-              )
-
+              IN_DEGREE["$dependent"]=$(( ${IN_DEGREE[$dependent]} - 1 ))
               if [[ "${IN_DEGREE[$dependent]}" -eq 0 ]]; then
-
                 ready+=("$dependent")
-
-                IFS=$'\n'
-                ready=($(sort <<< "${ready[*]}"))
+                IFS=$'\n' ready=($(sort <<< "${ready[*]}"))
                 unset IFS
-
               fi
-
             done
-
           done
 
-          if [[ \
-            "${#BUILD_ORDER[@]}" -ne
-            "$(for c in "${COMPONENTS[@]}"; do
-                [[ -n "${SELECTED[$c]:-}" ]] && echo "$c"
-              done | wc -l)"
-          ]]; then
-
-            echo
-            echo "ERROR: dependency graph contains a cycle."
+          if [[ "${#BUILD_ORDER[@]}" -ne "${#SELECTED[@]}" ]]; then
+            echo "ERROR: dependency graph contains a cycle or could not be resolved." >&2
             exit 1
-
           fi
 
-          # ========================================================
-          # BUILD ORDER
-          # ========================================================
-
-          echo
-          echo "============================================================"
-          echo "FINAL BUILD ORDER"
-          echo "============================================================"
-
+          echo "Final build order:"
           sequence=0
-
           for component in "${BUILD_ORDER[@]}"; do
-
             sequence=$((sequence + 1))
-
             if [[ -n "${CHANGED[$component]:-}" ]]; then
-
-              printf \
-                '  %02d. %-15s CHANGED\n' \
-                "$sequence" \
-                "$component"
-
+              printf '  %02d. %-12s CHANGED\n' "$sequence" "$component"
             else
-
-              printf \
-                '  %02d. %-15s TRANSITIVE DEPENDENT\n' \
-                "$sequence" \
-                "$component"
-
+              printf '  %02d. %-12s DEPENDENT\n' "$sequence" "$component"
             fi
-
           done
 
-          # ========================================================
-          # 6. DEPENDENCY GRAPH / REPORT
-          # ========================================================
-
+          # ------------------------------------------------------------
+          # 6. Display and publish dependency graph.
+          # ------------------------------------------------------------
           echo
-          echo "[6/6] Creating dependency graph and impact report..."
-
-          # --------------------------------------------------------
-          # Full dependency graph
-          # --------------------------------------------------------
-
+          echo "[6/6] Dependency graph"
           {
-            echo "# Full Product Dependency Graph"
-            echo
-            echo "Direction: dependency --> dependent"
-            echo
-
             echo '```mermaid'
             echo 'graph TD'
-
             for component in "${COMPONENTS[@]}"; do
               echo "  ${component}[${component}]"
             done
-
             for edge in "${!EDGES[@]}"; do
-
               dependency="${edge%%|*}"
               dependent="${edge#*|}"
-
               echo "  ${dependency} --> ${dependent}"
-
             done
-
             echo '```'
-
-          } > dependency-graph.md
-
-          # --------------------------------------------------------
-          # Changed scenario selected rebuild graph
-          # --------------------------------------------------------
-
-          {
-            echo
-            echo "# Changed Scenario — Selected Rebuild Graph"
-            echo
-            echo "Only modules selected for this run are included below."
-            echo
-            echo '```mermaid'
-            echo 'graph TD'
-
-            for component in "${BUILD_ORDER[@]}"; do
-              echo "  ${component}[${component}]"
-            done
-
-            for edge in "${!EDGES[@]}"; do
-
-              dependency="${edge%%|*}"
-              dependent="${edge#*|}"
-
-              if [[ \
-                -n "${SELECTED[$dependency]:-}" &&
-                -n "${SELECTED[$dependent]:-}"
-              ]]; then
-
-                echo "  ${dependency} --> ${dependent}"
-
-              fi
-
-            done
-
-            echo '```'
-
-          } >> dependency-graph.md
-
-          # --------------------------------------------------------
-          # Explicit dependency paths for changed modules
-          # --------------------------------------------------------
-
-          {
-            echo
-            echo "# Dependency Paths for Changed Components"
-
-            for changed_component in "${COMPONENTS[@]}"; do
-
-              [[ \
-                -n "${CHANGED[$changed_component]:-}"
-              ]] || continue
-
-              echo
-              echo "## ${changed_component}"
-              echo
-              echo "${changed_component}"
-
-              current_level=("$changed_component")
-              visited_path=()
-
-              while ((${#current_level[@]} > 0)); do
-
-                next_level=()
-
-                for current in "${current_level[@]}"; do
-
-                  for edge in "${!EDGES[@]}"; do
-
-                    dependency="${edge%%|*}"
-                    dependent="${edge#*|}"
-
-                    [[ \
-                      "$dependency" == "$current"
-                    ]] || continue
-
-                    [[ \
-                      -n "${SELECTED[$dependent]:-}"
-                    ]] || continue
-
-                    already_seen=0
-
-                    for seen in "${visited_path[@]}"; do
-
-                      if [[ "$seen" == "$dependent" ]]; then
-                        already_seen=1
-                        break
-                      fi
-
-                    done
-
-                    [[ "$already_seen" -eq 0 ]] || continue
-
-                    visited_path+=("$dependent")
-                    next_level+=("$dependent")
-
-                    echo \
-                      "  |-- ${current} --> ${dependent}"
-
-                  done
-
-                done
-
-                current_level=("${next_level[@]}")
-
-              done
-
-            done
-
-          } >> dependency-graph.md
-
-          # --------------------------------------------------------
-          # GitHub Job Summary
-          # --------------------------------------------------------
+          } | tee dependency-graph.md
 
           {
             echo "## Northwind OSGi Smart Build"
             echo
             echo "**Mode:** ${BUILD_MODE}"
             echo
-            echo "### Changed components"
-
+            echo '### Changed components'
             for component in "${COMPONENTS[@]}"; do
-
-              if [[ \
-                -n "${CHANGED[$component]:-}"
-              ]]; then
-
-                printf \
-                  -- '- `%s`\n' \
-                  "$component"
-
-              fi
-
+              [[ -n "${CHANGED[$component]:-}" ]] && printf -- '- `%s`\n' "$component"
             done
-
             echo
-            echo "### Selected for rebuild"
-
+            echo '### Selected for rebuild'
             for component in "${BUILD_ORDER[@]}"; do
-
-              if [[ \
-                -n "${CHANGED[$component]:-}"
-              ]]; then
-
-                printf \
-                  -- '- `%s` — CHANGED\n' \
-                  "$component"
-
+              if [[ -n "${CHANGED[$component]:-}" ]]; then
+                printf -- '- `%s` — CHANGED\n' "$component"
               else
-
-                printf \
-                  -- '- `%s` — TRANSITIVE DEPENDENT\n' \
-                  "$component"
-
+                printf -- '- `%s` — TRANSITIVE DEPENDENT\n' "$component"
               fi
-
             done
-
             echo
-            echo "### Build order"
-
+            echo '### Build order'
             sequence=0
-
             for component in "${BUILD_ORDER[@]}"; do
-
               sequence=$((sequence + 1))
-
-              printf \
-                '%s. `%s`\n' \
-                "$sequence" \
-                "$component"
-
+              printf '%s. `%s`\n' "$sequence" "$component"
             done
-
             echo
-            echo "### Dependency direction"
-            echo
-            echo '```text'
-            echo "dependency --> dependent"
-            echo '```'
-
-            echo
-            echo "### Dependency graph"
-
+            echo '### Dependency graph'
             cat dependency-graph.md
-
           } >> "$GITHUB_STEP_SUMMARY"
-
-          echo
-          echo "Build report created:"
-          echo "  dependency-graph.md"
 
           echo "${BUILD_ORDER[*]}" > build-order.txt
 
-          # ========================================================
-          # BUILD ONLY SELECTED COMPONENTS
-          # ========================================================
-
           echo
-          echo "============================================================"
-          echo "STARTING MAVEN / TYCHO BUILDS"
-          echo "============================================================"
-
+          echo "Starting Maven/Tycho builds in calculated order..."
           for component in "${BUILD_ORDER[@]}"; do
-
             echo
             echo "============================================================"
             echo "BUILD: $component"
             echo "============================================================"
-
-            mvn \
-              -B \
-              -ntp \
-              -f "$component/pom.xml" \
-              clean install \
-              -DskipTests
-
+            mvn -B -ntp -f "$component/pom.xml" clean install -DskipTests
           done
-
-          echo
-          echo "============================================================"
-          echo "SMART BUILD COMPLETED"
-          echo "============================================================"
-
-      # ============================================================
-      # 4. UPLOAD REPORT
-      # ============================================================
 
       - name: Upload dependency graph and build order
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: northwind-osgi-build-report
-
           path: |
             osgi-workshop/dependency-graph.md
             osgi-workshop/build-order.txt
-
           if-no-files-found: ignore
-          
