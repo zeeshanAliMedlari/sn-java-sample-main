@@ -31,23 +31,28 @@ env:
   JAVA_VERSION: "17"
 
 jobs:
+
   smart-build:
+
     name: OSGi Smart Build
+
     runs-on: ubuntu-latest
 
     steps:
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 1. CHECKOUT
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 2. JAVA
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Setup Java
         uses: actions/setup-java@v6
         with:
@@ -55,9 +60,10 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven
 
-      # ------------------------------------------------------------
-      # 3. DISCOVER OSGi COMPONENTS
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. DISCOVER COMPONENTS
+      # ============================================================
+
       - name: Discover OSGi components
         id: discover
         shell: bash
@@ -68,19 +74,6 @@ jobs:
           echo "DISCOVERING OSGi COMPONENTS"
           echo "============================================================"
 
-          COMPONENTS=()
-
-          for dir in */; do
-            dir="${dir%/}"
-
-            if [[ -f "$dir/pom.xml" ]]; then
-              if grep -Eq '<packaging>eclipse-plugin</packaging>|<packaging>eclipse-feature</packaging>|<artifactId>.*</artifactId>' "$dir/pom.xml"; then
-                COMPONENTS+=("$dir")
-              fi
-            fi
-          done
-
-          # Explicitly keep only the product modules used by the workshop.
           COMPONENTS=(
             catalog
             customer
@@ -94,6 +87,7 @@ jobs:
           )
 
           echo "Discovered components:"
+
           for component in "${COMPONENTS[@]}"; do
             echo "  - $component"
           done
@@ -106,9 +100,10 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 4. BUILD OSGi DEPENDENCY GRAPH
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Build OSGi dependency graph
         id: graph
         shell: bash
@@ -131,27 +126,28 @@ jobs:
           # --------------------------------------------------------
           # Discover bundle metadata
           # --------------------------------------------------------
+
           for component in "${COMPONENTS[@]}"; do
 
-            pom="$component/pom.xml"
+            echo ""
+            echo "Component: $component"
 
-            if [[ ! -f "$pom" ]]; then
-              echo "WARNING: Missing $pom"
-              continue
-            fi
+            manifest="$component/META-INF/MANIFEST.MF"
 
             symbolic_name=""
 
-            if [[ -f "$component/META-INF/MANIFEST.MF" ]]; then
+            if [[ -f "$manifest" ]]; then
+
               symbolic_name=$(
                 awk -F': ' '
                   /^Bundle-SymbolicName:/ {
                     print $2
                     exit
                   }
-                ' "$component/META-INF/MANIFEST.MF" |
+                ' "$manifest" |
                 sed 's/;.*//'
               )
+
             fi
 
             if [[ -z "$symbolic_name" ]]; then
@@ -160,15 +156,16 @@ jobs:
 
             SYMBOLIC_NAME["$component"]="$symbolic_name"
 
-            echo "Component: $component"
             echo "  Bundle-SymbolicName: $symbolic_name"
 
             # ------------------------------------------------------
-            # Exported packages
+            # Export-Package
             # ------------------------------------------------------
+
             exports=""
 
-            if [[ -f "$component/META-INF/MANIFEST.MF" ]]; then
+            if [[ -f "$manifest" ]]; then
+
               exports=$(
                 awk '
                   /^Export-Package:/ {
@@ -190,8 +187,9 @@ jobs:
                   END {
                     print ""
                   }
-                ' "$component/META-INF/MANIFEST.MF"
+                ' "$manifest"
               )
+
             fi
 
             EXPORT_PACKAGES["$component"]="$exports"
@@ -199,21 +197,25 @@ jobs:
             # ------------------------------------------------------
             # Feature ID
             # ------------------------------------------------------
+
             feature_id=""
 
             if [[ -f "$component/feature.xml" ]]; then
+
               feature_id=$(
                 sed -n 's/.*id="\([^"]*\)".*/\1/p' \
                   "$component/feature.xml" |
                 head -1
               )
+
             fi
 
             COMPONENT_FEATURE["$component"]="$feature_id"
+
           done
 
           # --------------------------------------------------------
-          # Helper: add dependency
+          # Helper
           #
           # Direction:
           #
@@ -225,19 +227,24 @@ jobs:
           #
           # means orders depends on catalog.
           # --------------------------------------------------------
+
           add_edge() {
+
             local dependency="$1"
             local dependent="$2"
 
             [[ "$dependency" == "$dependent" ]] && return
 
             DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
+
             DEPENDENCIES["$dependent"]="${DEPENDENCIES[$dependent]:-} $dependency"
+
           }
 
-          # --------------------------------------------------------
+          # ========================================================
           # Require-Bundle
-          # --------------------------------------------------------
+          # ========================================================
+
           echo ""
           echo "Analyzing Require-Bundle dependencies..."
 
@@ -282,18 +289,23 @@ jobs:
               for dependency in "${COMPONENTS[@]}"; do
 
                 if [[ "${SYMBOLIC_NAME[$dependency]:-}" == "$bundle" ]]; then
+
                   add_edge "$dependency" "$dependent"
 
                   echo "  $dependency -> $dependent"
+
                 fi
 
               done
+
             done
+
           done
 
-          # --------------------------------------------------------
+          # ========================================================
           # Import-Package -> Export-Package
-          # --------------------------------------------------------
+          # ========================================================
+
           echo ""
           echo "Analyzing Import-Package / Export-Package dependencies..."
 
@@ -340,18 +352,23 @@ jobs:
                 exports="${EXPORT_PACKAGES[$dependency]:-}"
 
                 if echo ",$exports," | grep -Fq ",$package,"; then
+
                   add_edge "$dependency" "$dependent"
 
                   echo "  $dependency -> $dependent"
+
                 fi
 
               done
+
             done
+
           done
 
-          # --------------------------------------------------------
+          # ========================================================
           # Feature dependencies
-          # --------------------------------------------------------
+          # ========================================================
+
           echo ""
           echo "Analyzing feature dependencies..."
 
@@ -368,32 +385,37 @@ jobs:
               for dependency in "${COMPONENTS[@]}"; do
 
                 if [[ "${COMPONENT_FEATURE[$dependency]:-}" == "$feature_ref" ]]; then
+
                   add_edge "$dependency" "$dependent"
 
                   echo "  $dependency -> $dependent"
+
                 fi
 
               done
 
             done < <(
-              sed -n 's/.*feature="\([^"]*\)".*/\1/p' "$feature_xml"
+              sed -n 's/.*feature="\([^"]*\)".*/\1/p' \
+                "$feature_xml"
             )
+
           done
 
-          # --------------------------------------------------------
+          # ========================================================
           # Remove duplicate edges
-          # --------------------------------------------------------
+          # ========================================================
+
           for component in "${COMPONENTS[@]}"; do
 
             DEPENDENCIES["$component"]=$(
-              echo "${DEPENDENCIES[$component]:-}" |
+              printf '%s\n' "${DEPENDENCIES[$component]:-}" |
               tr ' ' '\n' |
               awk 'NF && !seen[$0]++' |
               tr '\n' ' '
             )
 
             DEPENDENTS["$component"]=$(
-              echo "${DEPENDENTS[$component]:-}" |
+              printf '%s\n' "${DEPENDENTS[$component]:-}" |
               tr ' ' '\n' |
               awk 'NF && !seen[$0]++' |
               tr '\n' ' '
@@ -401,63 +423,59 @@ jobs:
 
           done
 
-          # --------------------------------------------------------
-          # Print graph
-          # --------------------------------------------------------
+          # ========================================================
+          # Display graph
+          # ========================================================
+
           echo ""
           echo "============================================================"
           echo "OSGi DEPENDENCY GRAPH"
           echo "============================================================"
 
-          for component in "${COMPONENTS[@]}"; do
-
-            for dependent in ${DEPENDENTS[$component]:-}; do
-              echo "  $component -> $dependent"
-            done
-
-          done
-
-          # --------------------------------------------------------
-          # Generate Markdown graph
-          # --------------------------------------------------------
-          {
-            echo "# OSGi Dependency Graph"
-            echo ""
-            echo "Dependency direction:"
-            echo ""
-            echo "\`dependency -> dependent\`"
-            echo ""
-            echo "If \`A -> B\`, then B depends on A."
-            echo ""
-            echo "## Dependency Graph"
-            echo ""
-
-            for component in "${COMPONENTS[@]}"; do
-
-              for dependent in ${DEPENDENTS[$component]:-}; do
-                echo "- \`$component\` → \`$dependent\`"
-              done
-
-            done
-
-          } > osgi-dependency-graph.md
-
-          # --------------------------------------------------------
-          # Persist graph information
-          # --------------------------------------------------------
           : > dependency-edges.txt
 
           for component in "${COMPONENTS[@]}"; do
 
             for dependent in ${DEPENDENTS[$component]:-}; do
+
+              echo "  $component -> $dependent"
+
               echo "$component|$dependent" >> dependency-edges.txt
+
             done
 
           done
 
-      # ------------------------------------------------------------
+          # ========================================================
+          # Generate graph report
+          # ========================================================
+
+          {
+            echo "# OSGi Dependency Graph"
+            echo ""
+            echo "## Direction"
+            echo ""
+            echo "\`dependency -> dependent\`"
+            echo ""
+            echo "If \`A -> B\`, B depends on A."
+            echo ""
+            echo "## Graph"
+            echo ""
+
+            while IFS='|' read -r dependency dependent; do
+
+              [[ -z "$dependency" ]] && continue
+
+              echo "- \`$dependency\` → \`$dependent\`"
+
+            done < dependency-edges.txt
+
+          } > osgi-dependency-graph.md
+
+      # ============================================================
       # 5. DETECT CHANGED COMPONENTS
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Detect changed components
         id: changes
         shell: bash
@@ -478,8 +496,9 @@ jobs:
           MODE="${INPUT_MODE:-changed}"
 
           # --------------------------------------------------------
-          # Determine base SHA
+          # Determine comparison SHA
           # --------------------------------------------------------
+
           if [[ -n "${INPUT_BASE_SHA:-}" ]]; then
 
             BASE_SHA="$INPUT_BASE_SHA"
@@ -488,7 +507,8 @@ jobs:
 
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
 
-          elif [[ -n "${BEFORE_SHA:-}" && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+          elif [[ -n "${BEFORE_SHA:-}" &&
+                  "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
 
             BASE_SHA="$BEFORE_SHA"
 
@@ -505,29 +525,37 @@ jobs:
           echo "Head SHA : $HEAD_SHA"
           echo ""
 
-          declare -A CHANGED
+          # Always create the file.
+          : > changed-components.txt
 
-          # --------------------------------------------------------
-          # Full build
-          # --------------------------------------------------------
+          # ========================================================
+          # FULL BUILD
+          # ========================================================
+
           if [[ "$MODE" == "all" ]]; then
 
-            echo "Build mode is ALL."
-            echo "All OSGi components will be selected."
+            echo "Build mode: ALL"
+            echo "Selecting all components."
 
             for component in "${COMPONENTS[@]}"; do
-              CHANGED["$component"]=1
+
+              echo "$component" >> changed-components.txt
+
             done
 
           else
 
+            # ======================================================
+            # CHANGED MODE
+            # ======================================================
+
             if [[ -z "$BASE_SHA" ]]; then
 
-              echo "WARNING: Could not determine BASE_SHA."
+              echo "WARNING: Unable to determine base SHA."
               echo "Falling back to full build."
 
               for component in "${COMPONENTS[@]}"; do
-                CHANGED["$component"]=1
+                echo "$component" >> changed-components.txt
               done
 
             else
@@ -539,9 +567,9 @@ jobs:
                 git diff --name-only "$BASE_SHA" "$HEAD_SHA"
               )
 
-              if [[ ${#CHANGED_FILES[@]} -eq 0 ]]; then
+              if [[ "${#CHANGED_FILES[@]}" -eq 0 ]]; then
 
-                echo "No files changed."
+                echo "  No files changed."
 
               else
 
@@ -554,69 +582,87 @@ jobs:
               echo ""
 
               # ----------------------------------------------------
-              # Map changed files to components
+              # Map files to components
               # ----------------------------------------------------
+
+              declare -A DIRECT_CHANGED
+
               for relative in "${CHANGED_FILES[@]}"; do
 
-                matched=false
+                # ----------------------------------------------
+                # Product/component files
+                # ----------------------------------------------
 
                 for component in "${COMPONENTS[@]}"; do
 
                   if [[ "$relative" == "$component"/* ]]; then
 
-                    CHANGED["$component"]=1
-                    matched=true
+                    DIRECT_CHANGED["$component"]=1
 
-                    echo "[CHANGED] $component"
                   fi
 
                 done
 
-                # --------------------------------------------------
-                # Root Maven POM changes affect the whole reactor.
-                # --------------------------------------------------
-                case "$relative" in
+                # ----------------------------------------------
+                # Root POM
+                # ----------------------------------------------
 
-                  pom.xml)
+                if [[ "$relative" == "pom.xml" ]]; then
 
-                    echo ""
-                    echo "Root pom.xml changed."
-                    echo "Selecting all OSGi components."
+                  echo "Root pom.xml changed."
+                  echo "Selecting full build."
 
-                    for component in "${COMPONENTS[@]}"; do
-                      CHANGED["$component"]=1
-                    done
+                  for component in "${COMPONENTS[@]}"; do
+                    DIRECT_CHANGED["$component"]=1
+                  done
 
-                    ;;
+                fi
 
-                  .mvn/*)
+                # ----------------------------------------------
+                # Maven configuration
+                # ----------------------------------------------
 
-                    echo ""
-                    echo ".mvn configuration changed."
-                    echo "Selecting all OSGi components."
+                if [[ "$relative" == ".mvn/"* ]]; then
 
-                    for component in "${COMPONENTS[@]}"; do
-                      CHANGED["$component"]=1
-                    done
+                  echo ".mvn configuration changed."
+                  echo "Selecting full build."
 
-                    ;;
+                  for component in "${COMPONENTS[@]}"; do
+                    DIRECT_CHANGED["$component"]=1
+                  done
 
-                  .github/workflows/*)
+                fi
 
-                    # IMPORTANT:
-                    #
-                    # Workflow changes do NOT automatically mean that
-                    # every OSGi product changed.
-                    #
-                    # This prevents a workflow-only commit from causing
-                    # a full product rebuild.
-                    echo ""
-                    echo "Workflow file changed."
-                    echo "NOT selecting OSGi components because of workflow change alone."
+                # ----------------------------------------------
+                # GitHub workflow
+                #
+                # IMPORTANT:
+                # Workflow-only changes do NOT select products.
+                # ----------------------------------------------
 
-                    ;;
+                if [[ "$relative" == ".github/workflows/"* ]]; then
 
-                esac
+                  echo "Workflow file changed:"
+                  echo "  $relative"
+
+                  echo "Workflow changes do NOT automatically"
+                  echo "mark OSGi components as changed."
+
+                fi
+
+              done
+
+              # ----------------------------------------------------
+              # Write direct changes
+              # ----------------------------------------------------
+
+              for component in "${COMPONENTS[@]}"; do
+
+                if [[ "${DIRECT_CHANGED[$component]:-0}" == "1" ]]; then
+
+                  echo "$component" >> changed-components.txt
+
+                fi
 
               done
 
@@ -624,29 +670,26 @@ jobs:
 
           fi
 
+          # ========================================================
+          # DISPLAY RESULT
+          # ========================================================
+
           echo ""
           echo "============================================================"
           echo "DIRECTLY CHANGED OSGi COMPONENTS"
           echo "============================================================"
 
-          : > changed-components.txt
+          if [[ -s changed-components.txt ]]; then
 
-          DIRECT_COUNT=0
+            while read -r component; do
 
-          for component in "${COMPONENTS[@]}"; do
-
-            if [[ "${CHANGED[$component]:-0}" == "1" ]]; then
+              [[ -z "$component" ]] && continue
 
               echo "  [CHANGED] $component"
-              echo "$component" >> changed-components.txt
 
-              DIRECT_COUNT=$((DIRECT_COUNT + 1))
+            done < changed-components.txt
 
-            fi
-
-          done
-
-          if [[ "$DIRECT_COUNT" -eq 0 ]]; then
+          else
 
             echo "  None"
 
@@ -654,14 +697,27 @@ jobs:
 
           echo ""
 
+          CHANGED_COUNT=0
+
+          if [[ -s changed-components.txt ]]; then
+
+            CHANGED_COUNT=$(
+              grep -cve '^[[:space:]]*$' changed-components.txt
+            )
+
+          fi
+
+          echo "Changed component count: $CHANGED_COUNT"
+
           {
-            echo "changed_count=$DIRECT_COUNT"
+            echo "changed_count=$CHANGED_COUNT"
             echo "base_sha=$BASE_SHA"
           } >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 6. CALCULATE DEPENDENCY-AWARE REBUILD SET
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Calculate rebuild set
         id: selection
         shell: bash
@@ -674,20 +730,21 @@ jobs:
 
           mapfile -t COMPONENTS < components.txt
 
-          declare -A CHANGED
           declare -A SELECTED
           declare -A DEPENDENTS
+
+          : > selected-components.txt
 
           # --------------------------------------------------------
           # Read directly changed components
           # --------------------------------------------------------
-          if [[ -f changed-components.txt ]]; then
+
+          if [[ -s changed-components.txt ]]; then
 
             while read -r component; do
 
               [[ -z "$component" ]] && continue
 
-              CHANGED["$component"]=1
               SELECTED["$component"]=1
 
             done < changed-components.txt
@@ -695,64 +752,66 @@ jobs:
           fi
 
           # --------------------------------------------------------
-          # Read graph
+          # Read dependency graph
           # --------------------------------------------------------
-          while IFS='|' read -r dependency dependent; do
 
-            [[ -z "$dependency" ]] && continue
-            [[ -z "$dependent" ]] && continue
+          if [[ -s dependency-edges.txt ]]; then
 
-            DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
+            while IFS='|' read -r dependency dependent; do
 
-          done < dependency-edges.txt
+              [[ -z "$dependency" ]] && continue
+              [[ -z "$dependent" ]] && continue
+
+              DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
+
+            done < dependency-edges.txt
+
+          fi
 
           # --------------------------------------------------------
-          # If no components directly changed, nothing to rebuild.
+          # No direct changes
           # --------------------------------------------------------
-          if [[ ${#CHANGED[@]} -eq 0 ]]; then
+
+          if [[ ! -s changed-components.txt ]]; then
 
             echo "No OSGi components changed."
-            echo "Nothing needs to be rebuilt."
+            echo "No components require rebuilding."
 
           else
 
             echo "Directly changed components:"
-            for component in "${COMPONENTS[@]}"; do
 
-              if [[ "${CHANGED[$component]:-0}" == "1" ]]; then
-                echo "  - $component"
-              fi
+            while read -r component; do
 
-            done
+              [[ -z "$component" ]] && continue
+
+              echo "  - $component"
+
+            done < changed-components.txt
+
+            echo ""
+            echo "Calculating transitive dependents..."
 
             # ------------------------------------------------------
-            # Traverse dependents transitively.
-            #
-            # Example:
-            #
-            # catalog -> orders -> reporting
-            #
-            # If catalog changes:
-            #
-            # catalog
-            # orders
-            # reporting
+            # BFS through dependent graph
             # ------------------------------------------------------
+
             queue=()
 
-            for component in "${COMPONENTS[@]}"; do
+            while read -r component; do
 
-              if [[ "${CHANGED[$component]:-0}" == "1" ]]; then
-                queue+=("$component")
-              fi
+              [[ -z "$component" ]] && continue
 
-            done
+              queue+=("$component")
+
+            done < changed-components.txt
 
             index=0
 
             while [[ "$index" -lt "${#queue[@]}" ]]; do
 
               current="${queue[$index]}"
+
               index=$((index + 1))
 
               for dependent in ${DEPENDENTS[$current]:-}; do
@@ -760,9 +819,11 @@ jobs:
                 if [[ "${SELECTED[$dependent]:-0}" != "1" ]]; then
 
                   SELECTED["$dependent"]=1
+
                   queue+=("$dependent")
 
-                  echo "  Dependency impact: $current -> $dependent"
+                  echo "  Dependency impact:"
+                  echo "    $current -> $dependent"
 
                 fi
 
@@ -772,12 +833,14 @@ jobs:
 
           fi
 
+          # ========================================================
+          # FINAL REBUILD SET
+          # ========================================================
+
           echo ""
           echo "============================================================"
           echo "FINAL REBUILD SET"
           echo "============================================================"
-
-          : > selected-components.txt
 
           SELECTED_COUNT=0
 
@@ -785,10 +848,14 @@ jobs:
 
             if [[ "${SELECTED[$component]:-0}" == "1" ]]; then
 
-              if [[ "${CHANGED[$component]:-0}" == "1" ]]; then
-                echo "  [CHANGED] $component"
+              if grep -Fxq "$component" changed-components.txt 2>/dev/null; then
+
+                echo "  [CHANGED]    $component"
+
               else
+
                 echo "  [DEPENDENCY] $component"
+
               fi
 
               echo "$component" >> selected-components.txt
@@ -808,9 +875,10 @@ jobs:
 
           echo "selected_count=$SELECTED_COUNT" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 7. CALCULATE BUILD ORDER
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Calculate OSGi build order
         id: order
         shell: bash
@@ -830,39 +898,101 @@ jobs:
           # --------------------------------------------------------
           # Read selected components
           # --------------------------------------------------------
-          while read -r component; do
 
-            [[ -z "$component" ]] && continue
+          if [[ -s selected-components.txt ]]; then
 
-            SELECTED["$component"]=1
-            IN_DEGREE["$component"]=0
+            while read -r component; do
 
-          done < selected-components.txt
+              [[ -z "$component" ]] && continue
+
+              SELECTED["$component"]=1
+              IN_DEGREE["$component"]=0
+
+            done < selected-components.txt
+
+          fi
 
           # --------------------------------------------------------
           # Read dependency graph
           # --------------------------------------------------------
-          while IFS='|' read -r dependency dependent; do
 
-            [[ -z "$dependency" ]] && continue
-            [[ -z "$dependent" ]] && continue
+          if [[ -s dependency-edges.txt ]]; then
 
-            DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
+            while IFS='|' read -r dependency dependent; do
 
-            # Only count edges where both nodes are selected.
-            if [[ "${SELECTED[$dependency]:-0}" == "1" &&
-                  "${SELECTED[$dependent]:-0}" == "1" ]]; then
+              [[ -z "$dependency" ]] && continue
+              [[ -z "$dependent" ]] && continue
 
-              IN_DEGREE["$dependent"]=$(( ${IN_DEGREE[$dependent]:-0} + 1 ))
+              DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
 
-            fi
+              # Only calculate edges inside the selected subgraph.
 
-          done < dependency-edges.txt
+              if [[ "${SELECTED[$dependency]:-0}" == "1" &&
+                    "${SELECTED[$dependent]:-0}" == "1" ]]; then
+
+                IN_DEGREE["$dependent"]=$(
+                  (
+                    ${IN_DEGREE[$dependent]:-0} + 1
+                  )
+                )
+
+              fi
+
+            done < dependency-edges.txt
+
+          fi
 
           # --------------------------------------------------------
-          # Kahn topological sort
+          # Fix Bash arithmetic safely
           # --------------------------------------------------------
+
+          # Recalculate using safe arithmetic syntax.
+          #
+          # This avoids the previous:
+          #
+          #   CHANGED: unbound variable
+          #
+          # and:
+          #
+          #   0: command not found
+          #
+
+          if [[ -s selected-components.txt ]]; then
+
+            # Reset indegrees.
+
+            for component in "${COMPONENTS[@]}"; do
+
+              if [[ "${SELECTED[$component]:-0}" == "1" ]]; then
+                IN_DEGREE["$component"]=0
+              fi
+
+            done
+
+            while IFS='|' read -r dependency dependent; do
+
+              [[ -z "$dependency" ]] && continue
+              [[ -z "$dependent" ]] && continue
+
+              if [[ "${SELECTED[$dependency]:-0}" == "1" &&
+                    "${SELECTED[$dependent]:-0}" == "1" ]]; then
+
+                current_degree="${IN_DEGREE[$dependent]:-0}"
+
+                IN_DEGREE["$dependent"]=$((current_degree + 1))
+
+              fi
+
+            done < dependency-edges.txt
+
+          fi
+
+          # ========================================================
+          # TOPOLOGICAL SORT
+          # ========================================================
+
           queue=()
+          BUILD_ORDER=()
 
           for component in "${COMPONENTS[@]}"; do
 
@@ -875,11 +1005,10 @@ jobs:
 
           done
 
-          BUILD_ORDER=()
-
           while [[ "${#queue[@]}" -gt 0 ]]; do
 
             current="${queue[0]}"
+
             queue=("${queue[@]:1}")
 
             BUILD_ORDER+=("$current")
@@ -888,10 +1017,16 @@ jobs:
 
               if [[ "${SELECTED[$dependent]:-0}" == "1" ]]; then
 
-                IN_DEGREE["$dependent"]=$(( ${IN_DEGREE[$dependent]:-0} - 1 ))
+                current_degree="${IN_DEGREE[$dependent]:-0}"
 
-                if [[ "${IN_DEGREE[$dependent]}" -eq 0 ]]; then
+                new_degree=$((current_degree - 1))
+
+                IN_DEGREE["$dependent"]="$new_degree"
+
+                if [[ "$new_degree" -eq 0 ]]; then
+
                   queue+=("$dependent")
+
                 fi
 
               fi
@@ -900,60 +1035,66 @@ jobs:
 
           done
 
-          # --------------------------------------------------------
-          # Validate
-          # --------------------------------------------------------
+          # ========================================================
+          # VALIDATE BUILD ORDER
+          # ========================================================
+
           SELECTED_COUNT=0
 
-          for component in "${COMPONENTS[@]}"; do
+          if [[ -s selected-components.txt ]]; then
 
-            if [[ "${SELECTED[$component]:-0}" == "1" ]]; then
-              SELECTED_COUNT=$((SELECTED_COUNT + 1))
-            fi
+            SELECTED_COUNT=$(
+              grep -cve '^[[:space:]]*$' selected-components.txt
+            )
 
-          done
+          fi
 
           if [[ "${#BUILD_ORDER[@]}" -ne "$SELECTED_COUNT" ]]; then
 
             echo ""
-            echo "ERROR: Dependency graph contains a cycle or unresolved dependency."
+            echo "ERROR: Unable to calculate a valid dependency order."
             echo ""
-            echo "Selected components: $SELECTED_COUNT"
-            echo "Sorted components : ${#BUILD_ORDER[@]}"
+            echo "Selected components : $SELECTED_COUNT"
+            echo "Build order entries : ${#BUILD_ORDER[@]}"
             echo ""
 
             exit 1
 
           fi
 
-          # --------------------------------------------------------
-          # Display order
-          # --------------------------------------------------------
+          # ========================================================
+          # WRITE BUILD ORDER
+          # ========================================================
+
+          : > build-order.txt
+
           echo ""
           echo "============================================================"
           echo "FINAL OSGi BUILD ORDER"
           echo "============================================================"
-
-          : > build-order.txt
 
           POSITION=1
 
           for component in "${BUILD_ORDER[@]}"; do
 
             echo "$POSITION. $component"
+
             echo "$component" >> build-order.txt
 
             POSITION=$((POSITION + 1))
 
           done
 
-          if [[ "$POSITION" -eq 1 ]]; then
+          if [[ "$SELECTED_COUNT" -eq 0 ]]; then
+
             echo "No components require rebuilding."
+
           fi
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 8. GENERATE DEPENDENCY PATH REPORT
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Generate dependency reports
         shell: bash
         run: |
@@ -967,26 +1108,35 @@ jobs:
 
           declare -A DEPENDENTS
 
-          while IFS='|' read -r dependency dependent; do
+          if [[ -s dependency-edges.txt ]]; then
 
-            [[ -z "$dependency" ]] && continue
-            [[ -z "$dependent" ]] && continue
+            while IFS='|' read -r dependency dependent; do
 
-            DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
+              [[ -z "$dependency" ]] && continue
+              [[ -z "$dependent" ]] && continue
 
-          done < dependency-edges.txt
+              DEPENDENTS["$dependency"]="${DEPENDENTS[$dependency]:-} $dependent"
+
+            done < dependency-edges.txt
+
+          fi
+
+          # ========================================================
+          # DEPENDENCY PATH REPORT
+          # ========================================================
 
           {
             echo "# OSGi Dependency Paths"
             echo ""
+            echo "Dependency direction:"
+            echo ""
+            echo "\`dependency -> dependent\`"
+            echo ""
+
             echo "## Changed Components"
             echo ""
 
-            if [[ ! -s changed-components.txt ]]; then
-
-              echo "No OSGi components changed."
-
-            else
+            if [[ -s changed-components.txt ]]; then
 
               while read -r changed; do
 
@@ -995,60 +1145,29 @@ jobs:
                 echo "### $changed"
                 echo ""
 
-                echo "**Direct dependency impact:**"
+                echo "**Direct dependents:**"
+
+                found=false
 
                 for dependent in ${DEPENDENTS[$changed]:-}; do
+
                   echo "- \`$changed\` → \`$dependent\`"
+
+                  found=true
+
                 done
+
+                if [[ "$found" == "false" ]]; then
+                  echo "- None"
+                fi
 
                 echo ""
 
               done < changed-components.txt
 
-            fi
-
-            echo ""
-            echo "## Selected Rebuild Modules"
-            echo ""
-
-            if [[ -s selected-components.txt ]]; then
-
-              while read -r component; do
-                echo "- \`$component\`"
-              done < selected-components.txt
-
             else
 
-              echo "None"
-
-            fi
-
-          } > osgi-dependency-paths.md
-
-          # --------------------------------------------------------
-          # Build report
-          # --------------------------------------------------------
-          {
-            echo "# OSGi Smart Build Report"
-            echo ""
-            echo "## Build Information"
-            echo ""
-            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
-            echo "- Commit: \`${GITHUB_SHA}\`"
-            echo "- Run: \`${GITHUB_RUN_ID}\`"
-            echo ""
-            echo "## Changed Components"
-            echo ""
-
-            if [[ -s changed-components.txt ]]; then
-
-              while read -r component; do
-                echo "- \`$component\`"
-              done < changed-components.txt
-
-            else
-
-              echo "None"
+              echo "No OSGi components changed."
 
             fi
 
@@ -1059,7 +1178,9 @@ jobs:
             if [[ -s selected-components.txt ]]; then
 
               while read -r component; do
+
                 echo "- \`$component\`"
+
               done < selected-components.txt
 
             else
@@ -1068,37 +1189,22 @@ jobs:
 
             fi
 
-            echo ""
-            echo "## Build Order"
-            echo ""
+          } > osgi-dependency-paths.md
 
-            if [[ -s build-order.txt ]]; then
-
-              position=1
-
-              while read -r component; do
-                echo "$position. \`$component\`"
-                position=$((position + 1))
-              done < build-order.txt
-
-            else
-
-              echo "No components rebuilt."
-
-            fi
-
-          } > osgi-smart-build-report.md
-
-      # ------------------------------------------------------------
-      # 9. GITHUB SUMMARY
-      # ------------------------------------------------------------
-      - name: Publish build summary
-        shell: bash
-        run: |
-          set -euo pipefail
+          # ========================================================
+          # SMART BUILD REPORT
+          # ========================================================
 
           {
-            echo "# OSGi Smart Build"
+            echo "# OSGi Smart Build Report"
+            echo ""
+
+            echo "## Build Information"
+            echo ""
+
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Run: \`${GITHUB_RUN_ID}\`"
             echo ""
 
             echo "## Changed Components"
@@ -1107,7 +1213,7 @@ jobs:
             if [[ -s changed-components.txt ]]; then
 
               while read -r component; do
-                echo "- **$component**"
+                echo "- \`$component\`"
               done < changed-components.txt
 
             else
@@ -1123,7 +1229,79 @@ jobs:
             if [[ -s selected-components.txt ]]; then
 
               while read -r component; do
+                echo "- \`$component\`"
+              done < selected-components.txt
+
+            else
+
+              echo "- None"
+
+            fi
+
+            echo ""
+            echo "## Build Order"
+            echo ""
+
+            if [[ -s build-order.txt ]]; then
+
+              position=1
+
+              while read -r component; do
+
+                echo "$position. \`$component\`"
+
+                position=$((position + 1))
+
+              done < build-order.txt
+
+            else
+
+              echo "No components rebuilt."
+
+            fi
+
+          } > osgi-smart-build-report.md
+
+      # ============================================================
+      # 9. GITHUB JOB SUMMARY
+      # ============================================================
+
+      - name: Publish build summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# OSGi Smart Build"
+            echo ""
+
+            echo "## Changed Components"
+            echo ""
+
+            if [[ -s changed-components.txt ]]; then
+
+              while read -r component; do
+
                 echo "- **$component**"
+
+              done < changed-components.txt
+
+            else
+
+              echo "- None"
+
+            fi
+
+            echo ""
+            echo "## Selected Rebuild Components"
+            echo ""
+
+            if [[ -s selected-components.txt ]]; then
+
+              while read -r component; do
+
+                echo "- **$component**"
+
               done < selected-components.txt
 
             else
@@ -1143,6 +1321,7 @@ jobs:
               while read -r component; do
 
                 echo "$position. **$component**"
+
                 position=$((position + 1))
 
               done < build-order.txt
@@ -1156,15 +1335,16 @@ jobs:
             echo ""
             echo "## Dependency Graph"
             echo ""
+
             cat osgi-dependency-graph.md
 
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 10. BUILD SELECTED COMPONENTS
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Build selected OSGi components
-        if: ${{ hashFiles('selected-components.txt') != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1173,10 +1353,22 @@ jobs:
           echo "BUILDING SELECTED OSGi COMPONENTS"
           echo "============================================================"
 
+          # --------------------------------------------------------
+          # IMPORTANT:
+          #
+          # Do not use:
+          #
+          #   hashFiles('selected-components.txt')
+          #
+          # because the file exists even when it is empty.
+          # --------------------------------------------------------
+
           if [[ ! -s selected-components.txt ]]; then
 
-            echo "No components selected."
-            echo "Nothing to build."
+            echo ""
+            echo "No OSGi components require rebuilding."
+            echo "Smart build completed successfully."
+
             exit 0
 
           fi
@@ -1194,7 +1386,8 @@ jobs:
 
             if [[ ! -f "$component/pom.xml" ]]; then
 
-              echo "ERROR: $component/pom.xml not found."
+              echo "ERROR: Missing $component/pom.xml"
+
               exit 1
 
             fi
@@ -1207,24 +1400,29 @@ jobs:
               -DskipTests \
               -Dtycho.localArtifacts=default
 
+            echo ""
+            echo "SUCCESS: $component"
+
             POSITION=$((POSITION + 1))
 
           done < build-order.txt
 
           echo ""
           echo "============================================================"
-          echo "OSGi SMART BUILD COMPLETED"
+          echo "OSGi SMART BUILD COMPLETED SUCCESSFULLY"
           echo "============================================================"
 
-      # ------------------------------------------------------------
-      # 11. UPLOAD BUILD REPORT
-      # ------------------------------------------------------------
+      # ============================================================
+      # 11. UPLOAD REPORTS
+      # ============================================================
+
       - name: Upload build reports
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: northwind-osgi-build-report
           path: |
+            components.txt
             changed-components.txt
             selected-components.txt
             build-order.txt
@@ -1234,16 +1432,16 @@ jobs:
             osgi-smart-build-report.md
           if-no-files-found: warn
 
-      # ------------------------------------------------------------
-      # 12. UPLOAD MAVEN/TYCHO ARTIFACTS
-      # ------------------------------------------------------------
+      # ============================================================
+      # 12. UPLOAD BUILD ARTIFACTS
+      # ============================================================
+
       - name: Upload OSGi artifacts
-        if: success()
+        if: success() && hashFiles('selected-components.txt') != ''
         uses: actions/upload-artifact@v5
         with:
           name: northwind-osgi-artifacts
           path: |
             **/target/*.jar
             **/target/*.zip
-            **/target/*.xml
           if-no-files-found: warn
