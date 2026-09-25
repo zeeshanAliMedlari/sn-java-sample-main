@@ -40,3 +40,6 @@ public final class Customer {
         STANDARD, SILVER, GOLD, PLATINUM
     }
 }
+
+
+// Testing changes

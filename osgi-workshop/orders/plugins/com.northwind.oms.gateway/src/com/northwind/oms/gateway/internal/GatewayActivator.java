@@ -25,3 +25,5 @@ public class GatewayActivator implements BundleActivator {
         GatewayActivator.context = null;
     }
 }
+
+// Testing changes
